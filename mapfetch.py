@@ -56,8 +56,28 @@ import bz2
 import shutil
 import platform
 import datetime
+import socket # this is to prevent using the wrong protocol
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Virtualenv check on Linux to avoid “externally managed” errors
+if sys.platform.startswith('linux') and sys.prefix == sys.base_prefix:
+    print("[!] Detected Linux system without an active virtual environment.")
+    print("    Trying to install packages globally can trigger")
+    print("    the “externally managed” (POP 668) error from pip.")
+    choice = input("Create and activate a venv now? (y/n): ").strip().lower()
+    if choice == 'y':
+        venv_dir = 'venv'
+        try:
+            subprocess.check_call([sys.executable, '-m', 'venv', venv_dir])
+            print(f"Virtual environment created at ./{venv_dir}")
+            print(f"[i] Activate it with:\n    source {venv_dir}/bin/activate\nThen execute the Python script again.")
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Failed to create venv: {e}")
+        sys.exit(0)
+    else:
+        print("[!] Please activate a virtual environment before running this script.")
+        sys.exit(1)
 
 # Module Check and Install
 required_modules = {
@@ -81,6 +101,33 @@ for package_name, import_name in required_modules.items():
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+
+_original_getaddrinfo = None
+
+def enforce_address_family(family):
+    """
+    Monkey-patch socket.getaddrinfo so that only the given family
+    (socket.AF_INET or socket.AF_INET6) is returned.
+    Returns the original getaddrinfo so you can restore it later.
+    """
+    global _original_getaddrinfo
+    import socket as _socket
+    _original_getaddrinfo = _socket.getaddrinfo
+
+    def getaddrinfo(host, port, fam, *args, **kwargs):
+        # ignore the fam passed in by requests, always use our family
+        return _original_getaddrinfo(host, port, family, *args[2:], **kwargs)
+
+    _socket.getaddrinfo = getaddrinfo
+    return _original_getaddrinfo
+
+def restore_address_family():
+    """Restore socket.getaddrinfo to its original behavior."""
+    global _original_getaddrinfo
+    import socket as _socket
+    if _original_getaddrinfo:
+        _socket.getaddrinfo = _original_getaddrinfo
+        _original_getaddrinfo = None
 
 # Globals
 
@@ -150,13 +197,15 @@ def validate_url(url):
         log(f"[!] URL check failed: {url} ({e})")
         return False
 
+existing_stems = set()
 existing_files = set()
 downloaded_files = []
 skipped_files = []
-failed_downloads = []
+failed_downloads = {}
 extracted_files = []
-failed_extractions = []
+failed_extractions = {}
 deleted_bz2_files = []
+failed_deletions = {}
 
 cpu_threads = multiprocessing.cpu_count()
 default_threads = max(1, cpu_threads // 2)
@@ -224,17 +273,27 @@ def disk_space_warning(path, required_space):
         log(f"[!] Disk space check failed: {e}")
         return False
 
+def normalize_stem(file_name):
+    # Remove trailing .bz2 (if present), *then* trailing .bsp (if present)
+    if file_name.lower().endswith('.bz2'):
+        file_name = file_name[:-4]
+    if file_name.lower().endswith('.bsp'):
+        file_name = file_name[:-4]
+    return file_name
+
 def scan_existing_maps(base_folder):
     log("\nScanning existing map files...")
     folders = ['maps', 'download/maps']
     for folder in folders:
         full_path = os.path.join(base_folder, folder)
-        if os.path.exists(full_path):
-            for root, _, files in os.walk(full_path):
-                for file in files:
-                    if file.endswith(('.bsp', '.bz2')):
-                        existing_files.add(file)
-    log(f"Found {len(existing_files)} existing map files.")
+        if not os.path.isdir(full_path):
+            continue
+        for root, _, files in os.walk(full_path):
+            for file in files:
+                if file.lower().endswith(('.bsp', '.bz2')):
+                    stem = normalize_stem(file)
+                    existing_stems.add(stem)
+    log(f"Found {len(existing_stems)} existing map stems.")
 
 def get_map_links(base_url):
     try:
@@ -310,7 +369,7 @@ def calculate_total_download_size(map_links):
     log(f"Total download size: {format_size(total_size)}")
     return total_size
 
-def confirm_large_download(map_count, total_size_bytes):        
+def confirm_large_download(map_count, total_size_bytes):
     warnings = []
     if map_count >= 100:
         warnings.append(f"You are about to download {map_count} maps.")
@@ -327,23 +386,41 @@ def confirm_large_download(map_count, total_size_bytes):
 # Download function
 
 def download_file(url, output_folder, progress_bar):
+    import socket
     file_name = url.split('/')[-1]
-    output_path = os.path.join(output_folder, file_name)
+    stem = normalize_stem(file_name)
 
-    if file_name in existing_files:
+    # SKIP if we already have this stem in ANY form:
+    if stem in existing_stems:
         skipped_files.append(file_name)
         progress_bar.update(1)
         return
 
-    attempt = 0
-    while attempt < max_retries and not cancel_event.is_set():
+    output_path = os.path.join(output_folder, file_name)
+    reason = None
+
+    # Try in order: system default, IPv4-only, IPv6-only
+    methods = [
+        ('default', None),
+        ('IPv4', socket.AF_INET),
+        ('IPv6', socket.AF_INET6),
+    ]
+
+    for method_name, family in methods:
+        # Ensure we start from a clean slate each time
+        restore_address_family()
+
+        if family:
+            enforce_address_family(family)
+            log(f"[i] {file_name}: forcing {method_name}…")
+
         try:
-            with requests.get(url, stream=True, timeout=30) as r:
+            with requests.get(url, stream=True, timeout=(10, 120)) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
 
                 with open(output_path, 'wb') as f, tqdm(
-                    desc=file_name,
+                    desc=f"{file_name} ({method_name})",
                     total=total_size,
                     unit='B',
                     unit_scale=True,
@@ -357,43 +434,57 @@ def download_file(url, output_folder, progress_bar):
                             f.write(chunk)
                             file_bar.update(len(chunk))
 
+            # Verify full download
             actual_size = os.path.getsize(output_path)
             if actual_size != total_size:
-                log(f"[!] Incomplete download detected: {file_name}")
-                failed_downloads.append(file_name)
-                os.remove(output_path)
-                progress_bar.update(1)
-                return
+                raise IOError(f"expected {total_size} bytes, got {actual_size}")
 
+            # Success!
             downloaded_files.append(file_name)
+            existing_stems.add(stem)
             progress_bar.update(1)
+            restore_address_family()
             return
 
         except Exception as e:
-            attempt += 1
-            if attempt >= max_retries:
-                log(f"[!] Failed to download {file_name} after {max_retries} attempts: {e}")
-                failed_downloads.append(file_name)
-            else:
-                log(f"[Retry {attempt}/{max_retries}] {file_name} due to error: {e}")
+            reason = str(e)
+            log(f"[!] {file_name} @ {method_name} failed: {reason}")
+            # Clean up partial file before next attempt
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            # and loop to the next method…
+
+    # All methods failed
+    restore_address_family()
+    failed_downloads[file_name] = reason or "unknown error"
+    progress_bar.update(1)
 
 # Decompression function
 
 def extract_bz2(file_path, output_folder, progress_bar):
     output_file = os.path.splitext(file_path)[0]
+    base = os.path.basename(file_path)
     attempt = 0
     while attempt < max_retries:
         try:
             with bz2.BZ2File(file_path, 'rb') as fr, open(output_file, 'wb') as fw:
                 shutil.copyfileobj(fr, fw)
             extracted_files.append(os.path.basename(output_file))
+
+            # also mark stem so no re-download in same run
+            existing_stems.add(normalize_stem(base))
+
             progress_bar.update(1)
             return True
         except Exception as e:
             attempt += 1
+            reason = str(e)
             if attempt >= max_retries:
-                log(f"[!] Failed to extract {file_path}: {e}")
-                failed_extractions.append(os.path.basename(file_path))
+                log(f"[!] Failed to extract {base}: {reason}")
+                failed_extractions[base] = reason
                 progress_bar.update(1)
                 return False
 
@@ -413,18 +504,60 @@ def print_summary():
     log(f"Extracted .bz2 files: {len(extracted_files)}")
     log(f"Failed extractions: {len(failed_extractions)}")
     log(f"Deleted .bz2 files: {len(deleted_bz2_files)}")
-    log(f"CPU threads used: {max_workers}")
+    log(f"Failed deletions: {len(failed_deletions)}")
     log("==========================")
+
+    # Only show error log if there are any failures
+    if failed_downloads or failed_extractions or failed_deletions:
+        log("\n=== Error log ===")
+        if failed_downloads:
+            log("\nDownloads:")
+            for fname, reason in failed_downloads.items():
+                log(f" - {fname} ===> Download failed: {reason}")
+        if failed_extractions:
+            log("\nExtractions:")
+            for fname, reason in failed_extractions.items():
+                log(f" - {fname} ===> Extraction failed: {reason}")
+        if failed_deletions:
+            log("\nDeletions:")
+            for fname, reason in failed_deletions.items():
+                log(f" - {fname} ===> Deletion failed: {reason}")
 
 def colorize_warning(text):
     # ANSI escape codes for bright yellow text on red background
     return f"\033[1;33;41m{text}\033[0m"
-    
+
 # Main driver
 
 def main():
     start_time = datetime.datetime.now()
     log_file_name = f"download_summary_{start_time.strftime('%Y%m%d_%H%M%S')}.txt"
+
+    # ——— Clear the screen ———
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+    # ——— Welcome banner ———
+    print(r"""
+  __  __                   _____                      _                 _
+ |  \/  |                 |  __ \                    | |               | |
+ | \  / | __ _ _ __  ___  | |  | | _____      ___ __ | | ___   __ _  __| | ___ _ __
+ | |\/| |/ _` | '_ \/ __| | |  | |/ _ \ \ /\ / / '_ \| |/ _ \ / _` |/ _` |/ _ \ '__|
+ | |  | | (_| | |_) \__ \ | |__| | (_) \ V  V /| | | | | (_) | (_| | (_| |  __/ |
+ |_|  |_|\__,_| .__/|___/ |_____/ \___/ \_/\_/ |_| |_|_|\___/ \__,_|\__,_|\___|_|
+              | |
+              |_|
+    """)
+    print(r"""
+         _             _____     _              ____
+        | |           |  __ \   | |            |  _ \
+        | |__  _   _  | |__) ___| |_ ___ _ __  | |_) |_ __ _____   __
+        | '_ \| | | | |  ___/ _ \ __/ _ \ '__| |  _ <| '__/ _ \ \ / /
+        | |_) | |_| | | |  |  __| ||  __| |    | |_) | | |  __/\ V /
+        |_.__/ \__, | |_|   \___|\__\___|_|    |____/|_|  \___| \_/
+                __/ |
+                |___/
+    """)
+    input("Press Enter to continue…\n")
 
     steam_path = get_steam_library()
     if steam_path:
@@ -453,7 +586,7 @@ def main():
         sys.exit(0)
     download_folder = default_download_folder if use_default == 'y' else input("Enter custom download folder: ").strip()
     os.makedirs(download_folder, exist_ok=True)
-    
+
     # Ensure 'download' and 'download/maps' folders exist inside hl2mp_folder
     download_base_folder = os.path.join(hl2mp_folder, 'download')
     download_maps_folder = os.path.join(download_base_folder, 'maps')
@@ -502,7 +635,7 @@ def main():
         delete_bz2_choice = remove_bz2 == 'y'
 
     urls = load_fastdl_urls()
-    
+
     # Collect all map links
     all_map_links = []
     for url in urls:
@@ -516,13 +649,16 @@ def main():
         save_log(log_file_name)
         return
 
+    total_size_bytes = 0
+
     if not skip_size_check:
         total_size_bytes = calculate_total_download_size(filtered_links)
-    if disk_space_warning(download_folder, total_size_bytes):
-        save_log(log_file_name)
-        sys.exit("[!] Insufficient disk space. Aborting to prevent issues.")
-    confirm_large_download(map_count, total_size_bytes)
+        # only check disk space if we actually computed a size
+        if disk_space_warning(download_folder, total_size_bytes):
+            save_log(log_file_name)
+            sys.exit("[!] Insufficient disk space. Aborting to prevent issues.")
 
+    confirm_large_download(map_count, total_size_bytes)
 
     try:
         user_threads = input(f"Enter number of CPU threads to use (leave blank for default: {default_threads}): ").strip()
@@ -537,10 +673,10 @@ def main():
         max_workers = default_threads
 
     print(f"[i] Using {max_workers} thread(s) for downloads and decompression.")
-    
+
     # Start cancel listener thread (hitting Enter)
     threading.Thread(target=listen_for_cancel, daemon=True).start()
-    
+
     # Download maps
     log("\nStarting downloads...")
     with tqdm(total=map_count, desc="Total Download Progress", unit="file") as progress_bar:
@@ -568,12 +704,14 @@ def main():
                         os.remove(bz2_file)
                         deleted_bz2_files.append(os.path.basename(bz2_file))
                     except Exception as e:
-                        log(f"[!] Failed to delete {bz2_file}: {e}")
+                        reason = str(e)
+                        log(f"[!] Failed to delete {bz2_file}: {reason}")
+                        failed_deletions[os.path.basename(bz2_file)] = reason
 
     # Print summary
     print_summary()
     save_log(log_file_name)
-    
+
     try:
         total, used, free = shutil.disk_usage(download_folder)
         log(f"Disk space remaining after process: {format_size(free)}")
@@ -581,9 +719,10 @@ def main():
         log(f"[!] Disk space retrieval failed at end of process: {e}")
 
     log("\nProcess completed!")
-    log(f"Summary log saved as: {log_file_name}")
+    log(f"Summary log saved as: {log_file_name}\n")
+    log(f"Press any key to exit.")
 
 if __name__ == "__main__":
-    main()   
+    main()
 
 # Weeeeeeeeeeeeee
