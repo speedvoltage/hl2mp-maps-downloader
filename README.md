@@ -3,8 +3,44 @@
 # HL2DM Auto Maps Downloader
 
 ### Author: Peter Brev  
-### Version: 1.0  
-### Last updated: 2025-04-06
+### Version: 1.0.1  
+### Last updated: 2025-05-01
+
+# Changelog
+
+## [1.0.1] - 2025-04-29
+
+### Added
+- **IPv6/IPv4 Failover Support**: 
+  - If a download attempt hangs or fails due to unreachable IPv6 endpoints, the script retries using IPv4-only resolution.
+  - Ensures successful downloads even if FastDL servers advertise broken IPv6 AAAA records.
+- **Address Resolution Control**:
+  - Added `enforce_address_family(family)` and `restore_address_family()` to manage forced IPv4 or IPv6 during download attempts.
+- **Virtual Environment Check** (Linux only):
+  - Script now detects if it's running outside a virtual environment.
+  - Offers to automatically create and activate a `venv` to prevent Python 3.12+ "externally managed" pip installation errors.
+- **Terminal Clear and Welcome Banner**:
+  - Clears the terminal window on script startup for a cleaner experience.
+  - Displays an ASCII art welcome banner for user friendliness.
+
+### Changed
+- **Download Logic Rewrite**:
+  - `download_file()` now intelligently retries over different IP families.
+  - Cleans up partial/incomplete downloads between retries to avoid file corruption.
+- **Existing Map Detection Improvement**:
+  - Now checks for both `.bsp` and `.bz2` versions of a map.
+  - Prevents re-downloading compressed maps if the uncompressed `.bsp` already exists.
+- **General Code Improvements**:
+  - Additional minor bug fixes, better error logging, more consistent behavior across systems.
+  - Improved cancellation handling mid-download.
+
+### Fixed
+- Partial `.bsp.bz2` files left after failed downloads.
+- Unwanted re-downloads when `.bsp` existed but `.bz2` did not.
+- Inconsistent behavior when IPv6 addresses were unreachable.
+
+## [1.0] - 2025-04-06
+- **Initial Release**
 
 ---
 
