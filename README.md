@@ -8,6 +8,18 @@
 
 # Changelog
 
+## [1.0.2] - 2026-01-12
+
+- Fix summary thread count accuracy
+- Fix disk space required calculation (accounts only for files that will be downloaded)
+- Central Config (no accidental global leakage)
+- Safer cancellation; atomic downloads (.part then rename)
+- Better Steam library discovery (libraryfolders.vdf)
+- Optional recursion into subfolders under /maps/
+- Robust size probing (HEAD with fallback); excludes existing files
+- Clear logs & summary written once at the end
+- Concurrent, visible enumeration of FastDL sources (no more "hang" feeling)
+
 ## [1.0.1] - 2025-04-29
 
 ### Added
