@@ -3,8 +3,8 @@
 # HL2DM Auto Maps Downloader
 
 ### Author: Peter Brev  
-### Version: 1.0.1  
-### Last updated: 2025-05-01
+### Version: 1.0.2  
+### Last updated: 2026-01-12
 
 # Changelog
 
