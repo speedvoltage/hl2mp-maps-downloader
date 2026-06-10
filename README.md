@@ -3,10 +3,14 @@
 # HL2DM Auto Maps Downloader
 
 ### Author: Peter Brev  
-### Version: 1.0.2  
-### Last updated: 2026-01-12
+### Version: 1.0.3  
+### Last updated: 2026-06-10
 
 # Changelog
+
+## [1.0.3] - 2026-06-10
+- Fix script failing to launch due to missing pip installation.
+- Minor bug fixes and improvements.
 
 ## [1.0.2] - 2026-01-12
 
