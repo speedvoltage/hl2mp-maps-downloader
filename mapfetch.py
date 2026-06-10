@@ -31,30 +31,237 @@ from typing import List, Set, Tuple, Optional
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Dependency bootstrap (quiet, no clutter) ---
-required_modules = {
-    'requests': 'requests',
-    'beautifulsoup4': 'bs4',
-    'tqdm': 'tqdm'
+# --- Dependency bootstrap ---
+REQUIRED_MODULES = {
+    "requests": "requests",
+    "beautifulsoup4": "bs4",
+    "tqdm": "tqdm",
 }
 
-def ensure_deps():
+REQUIREMENTS_TEXT = "requests\nbeautifulsoup4\ntqdm\n"
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parent
+VENV_DIR = PROJECT_ROOT / ".venv"
+VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
+
+
+def _missing_required_packages():
     missing = []
-    for pkg, imp in required_modules.items():
+    for package_name, import_name in REQUIRED_MODULES.items():
         try:
-            __import__(imp)
+            __import__(import_name)
         except ImportError:
-            missing.append(pkg)
-    if missing:
-        print(f"[!] Missing modules: {', '.join(missing)}")
-        choice = input(f"Install now via pip? (y/n): ").strip().lower()
-        if choice != 'y':
-            print("[!] Cannot continue without required modules. Exiting.")
+            missing.append(package_name)
+    return missing
+
+
+def _same_path(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return Path(left).absolute() == Path(right).absolute()
+
+
+def _running_inside_project_venv():
+    if _same_path(sys.executable, VENV_PYTHON):
+        return True
+    try:
+        return Path(sys.prefix).resolve() == VENV_DIR.resolve()
+    except OSError:
+        return False
+
+
+def _ensure_requirements_file():
+    try:
+        if REQUIREMENTS_FILE.exists():
+            current = REQUIREMENTS_FILE.read_text(encoding="utf-8")
+            if current == REQUIREMENTS_TEXT:
+                return True
+        REQUIREMENTS_FILE.write_text(REQUIREMENTS_TEXT, encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"[!] Could not create/update {REQUIREMENTS_FILE}: {exc}")
+        return False
+
+
+def _run_command(args, description):
+    try:
+        completed = subprocess.run(
+            [str(arg) for arg in args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return False, f"{description} failed: executable not found: {exc.filename}"
+    except OSError as exc:
+        return False, f"{description} failed: {exc}"
+
+    if completed.returncode == 0:
+        return True, ""
+
+    output = "\n".join(
+        part.strip()
+        for part in (completed.stdout, completed.stderr)
+        if part and part.strip()
+    )
+    if not output:
+        output = f"{description} failed with exit code {completed.returncode}."
+    return False, output
+
+
+def _print_debian_venv_help():
+    print("\n[!] Python virtual environment support appears to be missing.")
+    print("On Debian/Ubuntu, install it with:")
+    print()
+    print("sudo apt update")
+    print("sudo apt install python3-venv")
+    print("python3 mapfetch.py")
+
+
+def _print_manual_setup():
+    print("\nManual setup commands:")
+    print()
+    if os.name == "nt":
+        print("py -m venv .venv")
+        print(r".venv\Scripts\python.exe -m ensurepip --upgrade")
+        print(r".venv\Scripts\python.exe -m pip install --upgrade pip")
+        print(r".venv\Scripts\python.exe -m pip install -r requirements.txt")
+        print(r".venv\Scripts\python.exe mapfetch.py")
+    else:
+        print("python3 -m venv .venv")
+        print(".venv/bin/python -m ensurepip --upgrade")
+        print(".venv/bin/python -m pip install --upgrade pip")
+        print(".venv/bin/python -m pip install -r requirements.txt")
+        print(".venv/bin/python mapfetch.py")
+
+
+def _looks_like_missing_venv_support(output):
+    lowered = output.lower()
+    return (
+        "no module named venv" in lowered
+        or "ensurepip is not available" in lowered
+        or "python3-venv" in lowered
+    )
+
+
+def _create_project_venv():
+    if VENV_PYTHON.exists():
+        return True
+
+    print(f"[i] Creating local virtual environment: {VENV_DIR}")
+    ok, output = _run_command(
+        [sys.executable, "-m", "venv", str(VENV_DIR)],
+        "Virtual environment creation",
+    )
+    if ok and VENV_PYTHON.exists():
+        return True
+
+    print("[!] Failed to create the local virtual environment.")
+    if output:
+        print(output)
+    if os.name != "nt" and _looks_like_missing_venv_support(output):
+        _print_debian_venv_help()
+    else:
+        _print_manual_setup()
+    return False
+
+
+def _install_requirements(python_exe):
+    print("[i] Preparing pip inside the local virtual environment.")
+    ensurepip_ok, ensurepip_output = _run_command(
+        [python_exe, "-m", "ensurepip", "--upgrade"],
+        "ensurepip",
+    )
+
+    if not ensurepip_ok:
+        pip_check_ok, _ = _run_command(
+            [python_exe, "-m", "pip", "--version"],
+            "pip check",
+        )
+        if not pip_check_ok:
+            print("[!] pip is not available inside the virtual environment.")
+            if ensurepip_output:
+                print(ensurepip_output)
+            _print_manual_setup()
+            return False
+
+    print("[i] Upgrading pip inside the local virtual environment.")
+    pip_ok, pip_output = _run_command(
+        [python_exe, "-m", "pip", "install", "--upgrade", "pip"],
+        "pip upgrade",
+    )
+    if not pip_ok:
+        print("[!] Failed to upgrade pip inside the virtual environment.")
+        if pip_output:
+            print(pip_output)
+        _print_manual_setup()
+        return False
+
+    print(f"[i] Installing dependencies from {REQUIREMENTS_FILE.name}.")
+    install_ok, install_output = _run_command(
+        [python_exe, "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)],
+        "dependency installation",
+    )
+    if not install_ok:
+        print("[!] Failed to install Python dependencies.")
+        if install_output:
+            print(install_output)
+        _print_manual_setup()
+        return False
+
+    return True
+
+
+def _restart_inside_project_venv():
+    print("[i] Restarting mapfetch.py inside the local virtual environment.")
+    try:
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(SCRIPT_PATH), *sys.argv[1:]])
+    except OSError as exc:
+        print(f"[!] Failed to restart inside the virtual environment: {exc}")
+        _print_manual_setup()
+        sys.exit(1)
+
+
+def ensure_deps():
+    requirements_ready = _ensure_requirements_file()
+    missing = _missing_required_packages()
+    if not missing:
+        return
+
+    print(f"[!] Missing modules: {', '.join(missing)}")
+    choice = input("Set up dependencies automatically in a local .venv? (y/n): ").strip().lower()
+    if choice != "y":
+        print("[!] Cannot continue without required modules.")
+        _print_manual_setup()
+        sys.exit(1)
+
+    if not requirements_ready:
+        print("[!] Cannot continue because requirements.txt could not be prepared.")
+        _print_manual_setup()
+        sys.exit(1)
+
+    if not _running_inside_project_venv():
+        if not _create_project_venv():
             sys.exit(1)
-        for pkg in missing:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        if not _install_requirements(VENV_PYTHON):
+            sys.exit(1)
+        _restart_inside_project_venv()
+
+    if not _install_requirements(Path(sys.executable)):
+        sys.exit(1)
+
+    missing_after_install = _missing_required_packages()
+    if missing_after_install:
+        print(f"[!] Still missing after installation: {', '.join(missing_after_install)}")
+        _print_manual_setup()
+        sys.exit(1)
+
 
 ensure_deps()
+
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
